@@ -57,10 +57,10 @@
 /*
  * When posting a cancel, verify that the original message came from
  * this system.  Requires POST_FORCEMSGID.  Also prevents Supersedes
- * attacks.
+ * attacks. Enabled since blockchain does not accept changes on it's filesystem.
  */
 
-#undef	POST_RESTRICTCANCEL
+#define	POST_RESTRICTCANCEL
 
 /*
  * When posting a message, forcibly add an NNTP-Posting-Date:

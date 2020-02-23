@@ -201,7 +201,7 @@ main(int ac, char **av)
 	HistoryOpen(fileName, HGF_READONLY);
 
     if (VerboseOpt)
-	LoadSpoolCtl(0, 1);
+	LoadSpoolCtl(0, 1, 1);
 
 
     if (OldOpt) {

@@ -148,7 +148,7 @@ main(int ac, char **av)
 	    break;
 	}
 
-	n = sscanf(buf, "DUMP %x.%x.%x gm=%d ex=%d boff=%d bsize=%d flags=%c",
+	n = sscanf(buf, "DUMP %x.%x.%x gm=%d ex=%d boff=%lld bsize=%d flags=%c",
 	    &h.hv.h1,
 	    &h.hv.h2,
 	    &iter,

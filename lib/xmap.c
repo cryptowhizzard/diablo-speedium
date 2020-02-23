@@ -36,7 +36,7 @@ xmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset)
 
     st.st_size = 0;
     fstat(fd, &st);
-    if (offset + len > ((st.st_size + XPageMask) & ~XPageMask)) {
+    if (!S_ISBLK(st.st_mode) && (offset + len > ((st.st_size + XPageMask) & ~XPageMask))) {
         ptr = NULL;
 	errno = EINVAL;
     } else {

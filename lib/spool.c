@@ -44,9 +44,16 @@ Prototype uint16 GetSpoolFromPath(char *path);
 Prototype uint16 GetSpool(const char *msgid, const char *nglist, int size, int arttype, char *label, int *t, int *complvl);
 Prototype uint32 SpoolDirTime(void);
 Prototype int AllocateSpools(time_t t);
-Prototype void LoadSpoolCtl(time_t gmt, int force);
+Prototype void LoadSpoolCtl(time_t gmt, int force, int romode);
 Prototype int GetFirstSpool(uint16 *spoolnum, char **path, double *maxsize, double *minfree, long *minfreefiles, long *keeptime, int *expmethod);
 Prototype int GetNextSpool(uint16 *spoolnum, char **path, double *maxsize, double *minfree, long *minfreefiles, long *keeptime, int *expmethod);
+Prototype SpoolObject *findSpoolObject(uint16 spool);
+Prototype off_t getCycBufPos(SpoolObject *so, int size, int *cycles, int *flags);
+Prototype int lockCycBufArt(SpoolObject *so, History *h, int *locked);
+Prototype int checkCycBufSpool(uint16 spool);
+Prototype int checkCycBufBounds(SpoolObject *so, History *h);
+Prototype int checkArticle(char *relPath, char *msgId, off_t fileOff, int fileSize, uint16 spoolNum, char *spoolOpt);
+Prototype int md5CycBuf(SpoolObject *so, md5hash_t *md5);
 
 SpoolObject *SpoolObjects = NULL;
 SpoolObject *CurrentSpoolObject = NULL;
@@ -60,7 +67,7 @@ time_t DirTime = 0;
 int createSpoolDir(SpoolObject *so, uint32 gmt);
 uint16 findSpoolGrp(const char *msgid, GroupList *groups, int size, int ngcount, int arttype, char *label, int *t, int *complvl);
 int findLabel(LabelList *ll, char *label);
-void loadSpoolCtl(FILE *fi);
+void loadSpoolCtl(FILE *fi, int romode);
 double spaceFreeOn(char *part);
 int spoolSizeGb(char *part);
 void dumpSpoolConfig(void);
@@ -75,22 +82,26 @@ ArticleFileName(char *path, int pathSize, History *h, int opt)
 {
     char *spool;
 
-    spool = GetSpoolPath(H_SPOOL(h->exp), h->gmt, opt);
-
-    if (spool == NULL) {
-	strcpy(path, "/dev/null");
-	return;
-    }
-    switch (opt) {
-	case ARTFILE_DIR:
-	case ARTFILE_DIR_REL:
+    if (checkCycBufSpool(H_SPOOL(h->exp))) {
+	SpoolObject *so;
+	so = findSpoolObject(H_SPOOL(h->exp));
+	snprintf(path, pathSize, "%s", so->so_CPth);
+    } else {
+	spool = GetSpoolPath(H_SPOOL(h->exp), h->gmt, opt);
+	if (spool == NULL) {
+	    strcpy(path, "/dev/null");
+	    return;
+	}
+	switch (opt) {
+	    case ARTFILE_DIR:
+	    case ARTFILE_DIR_REL:
 		snprintf(path, pathSize, "%s%sD.%08x",
 					spool,
 					spool[0] ? "/" : "",
 					h->gmt - h->gmt % 10);
 		break;
-	case ARTFILE_FILE:
-	case ARTFILE_FILE_REL:
+	    case ARTFILE_FILE:
+	    case ARTFILE_FILE_REL:
 		if (h->boffset || h->bsize) {
 		    snprintf(path, pathSize, "%s%sD.%08x/B.%04x",
 					spool,
@@ -107,8 +118,9 @@ ArticleFileName(char *path, int pathSize, History *h, int opt)
 					h->iter);
     		}
 		break;
-	default:
+	    default:
 		break;
+	}
     }
     if (DebugOpt > 4)
 	printf("ArticleFileName=%s\n", path);
@@ -251,6 +263,10 @@ createSpoolDir(SpoolObject *so, uint32 gmt)
     History h;
     struct stat st;
 	
+    if (so->so_ExpireMethod==SPOOL_EXPIRE_CYCLIC) {
+	return(0); /* no need to create spool dir in a cyclic buffer */
+    }
+
     h.gmt = gmt;
     h.exp = so->so_SpoolNum + 100;
     ArticleFileName(path, sizeof(path), &h, ARTFILE_DIR);
@@ -419,8 +435,255 @@ findSpoolGrp(const char *msgid, GroupList *groups, int size, int ngcount, int ar
     return((uint16)-1);
 }
 
+SpoolObject*
+findSpoolObject(uint16 spool)
+{
+    if (spool > MAX_SPOOL_OBJECTS)
+	return(NULL);
+    if (SpoolObjectMap[spool] && SpoolObjectMap[spool]->so_SpoolNum == spool) {
+	return(SpoolObjectMap[spool]);
+    }
+    return(NULL);
+}
+
+int
+checkCycBufSpool(uint16 spool)
+{
+    SpoolObject *so;
+    
+    if (spool > MAX_SPOOL_OBJECTS)
+	return(0);
+    so = findSpoolObject(spool);
+    if (so->so_ExpireMethod==SPOOL_EXPIRE_CYCLIC) {
+	return(1);
+    }
+    return(0);
+}
+
+int
+checkCycBufBounds(SpoolObject *so, History *h)
+{
+    int cyc1, cyc2;
+    off_t pos;
+
+    cyc1=so->so_cbhHead->cbh_cycles;
+    pos=so->so_cbhHead->cbh_pos;
+    cyc2=so->so_cbhHead->cbh_cycles;
+    if (cyc1!=cyc2 || cyc1==-1) {
+	hflock(so->so_cbhHeadFD, 0, XLOCK_SH);
+	cyc1=so->so_cbhHead->cbh_cycles;
+	pos=so->so_cbhHead->cbh_pos;
+	hflock(so->so_cbhHeadFD, 0, XLOCK_UN);
+    }
+
+    if ((cyc1&0xffff)==h->iter) {
+	if (pos > h->boffset+h->bsize)
+	    return 0;
+	logit(LOG_CRIT, "cyclic spool pos corrupted (article %x.%x pos %lli cycles %i)", h->hv.h1, h->hv.h2, pos, cyc1);
+    } else if (((cyc1-1)&0xffff) == h->iter && pos < h->boffset)
+	return 0;
+    return -1;
+}
+
+int
+checkArticle(char *relPath, char *msgId, off_t fileOff, int fileSize, uint16 spoolNum, char *spoolOpt)
+{
+    if (checkCycBufSpool(spoolNum)) { /* spoolOpt should contain cycles */
+	SpoolObject *so;
+	History h;
+	
+	so = findSpoolObject(spoolNum);
+	h.iter = strtol(spoolOpt, NULL, 10) & 0xffff;
+	h.boffset = fileOff;
+	h.bsize = fileSize;
+	return checkCycBufBounds(so, &h);
+    }
+    return 0;
+}
+
+int
+lockCycBufArt(SpoolObject *so, History *h, int *locked)
+{
+    if (so->so_cbhSpoolFD<0) return -1;
+
+    if (checkCycBufBounds(so, h)) return -1;
+
+    if (lflock(so->so_cbhSpoolFD, h->boffset, h->bsize+1, XLOCK_SH|XLOCK_NB)<0) {
+logit(LOG_CRIT, "  locking cycbuf failed (fd %i %x@%llx)", so->so_cbhSpoolFD, h->bsize+1, h->boffset);
+	return -1;
+    }
+
+    if (checkCycBufBounds(so, h)) {
+logit(LOG_CRIT, "unlocking cycbuf (fd %i %x@%llx) due to bounds", so->so_cbhSpoolFD, h->bsize+1, h->boffset);
+	lflock(so->so_cbhSpoolFD, h->boffset, h->bsize+1, XLOCK_UN);
+	return -1;
+    }
+
+    *locked = so->so_cbhSpoolFD;
+    return 0;
+}
+
+off_t
+getCycBufPos(SpoolObject *so, int size, int *cycles, int *flags)
+{
+    if (so->so_cbhHead==NULL || so->so_cbhSpoolFD==-1 || so->so_cbhHeadFD==-1) {
+	return -1;
+    }
+
+    if(size) { /* écriture */
+	CyclicBufferHead *cbh = so->so_cbhHead;
+	int cyc;
+	off_t pos;
+
+	/* LOCK */
+	hflock(so->so_cbhHeadFD, 0, XLOCK_EX);
+
+	if (cbh->cbh_pos+size+1>cbh->cbh_size) { /* wrapping */
+	    if (flags) *flags |= CBH_WRAPPED;
+	    if (size<CBH_MD5_BUFSIZE) size = CBH_MD5_BUFSIZE-1;
+	    cyc = cbh->cbh_cycles;
+	    cbh->cbh_cycles = -1; /* read lock trigger */
+	    pos = cbh->cbh_offset;
+	    cbh->cbh_pos = pos+size+1;
+	    cbh->cbh_cycles = cyc+1;
+logit(LOG_CRIT, "getBufCycPos: wrap %llx+%x -> %llx (cycles %i)", pos, size, cbh->cbh_pos, cbh->cbh_cycles);
+	} else {
+	    pos = cbh->cbh_pos;
+	    cbh->cbh_pos += size+1;
+	}
+	*cycles = cbh->cbh_cycles;
+
+	/* UNLOCK */
+	hflock(so->so_cbhHeadFD, 0, XLOCK_UN);
+
+	return pos;
+    } else { /* lecture */
+	int cyc1, cyc2;
+	off_t pos;
+
+	cyc1=so->so_cbhHead->cbh_cycles;
+	pos=so->so_cbhHead->cbh_pos;
+	cyc2=so->so_cbhHead->cbh_cycles;
+	if (cyc1!=cyc2 || cyc1==-1) {
+	    hflock(so->so_cbhHeadFD, 0, XLOCK_SH);
+	    cyc1=so->so_cbhHead->cbh_cycles;
+	    pos=so->so_cbhHead->cbh_pos;
+	    hflock(so->so_cbhHeadFD, 0, XLOCK_UN);
+	}
+	*cycles = cyc1;
+	return pos;
+    }
+}
+
+/*
+ * the function checks so->so_cbhHead->cbh_md5 and return 0 if it matches
+ * if md5 is not NULL, it will store the md5 value into it
+ */
+int
+md5CycBuf(SpoolObject *so, md5hash_t *md5)
+{
+    char buf[CBH_MD5_BUFSIZE];
+    struct diablo_MD5Context ctx;
+    md5hash_t m;
+
+    if (md5==NULL) {
+	md5 = &m;
+    }
+
+    if (so->so_cbhHead->cbh_pos<512) {
+	printf("CycBuf : not enough data to process md5 on spool %s\n", so->so_Path);
+	exit(1);
+    }
+    lseek(so->so_cbhSpoolFD, so->so_cbhHead->cbh_offset, SEEK_SET);
+    read(so->so_cbhSpoolFD, buf, sizeof(buf));
+
+    diablo_MD5Init(&ctx);
+    diablo_MD5Update(&ctx, buf, sizeof(buf));
+
+    diablo_MD5Final((unsigned char *)md5, &ctx);
+    return memcmp(md5, &so->so_cbhHead->cbh_md5, sizeof(md5hash_t)); 
+}
+
 void
-addSpool(SpoolObject *so)
+openCycBuf(SpoolObject *so, char *path, char *spth, int romode)
+{
+    struct CyclicBufferHead cbh;
+    ssize_t r;
+
+    if (romode) {
+	so->so_cbhSpoolFD = open(path, O_RDONLY);
+    } else {
+	so->so_cbhSpoolFD = open(path, O_RDWR);
+    }
+    if (so->so_cbhSpoolFD==-1) {
+	logit(LOG_CRIT, "CycBuf : can not open file %s", path);
+	exit(1);
+    }
+    so->so_cbhHeadFD = so->so_cbhSpoolFD;
+    r = read(so->so_cbhSpoolFD, &cbh, sizeof(CyclicBufferHead));
+    if (r!=sizeof(CyclicBufferHead)) {
+	logit(LOG_CRIT, "CycBuf : short read %s (%i/%i)", path, r, sizeof(CyclicBufferHead));
+	if (cbh.cbh_version!=CBH_VERSION)
+		logit(LOG_CRIT, "CycBuf : wrong version, please update your buffer (%s)", path);
+	exit(1);
+    }
+    if (romode) {
+	so->so_cbhHead = xmap(NULL, sizeof(CyclicBufferHead), PROT_READ, MAP_SHARED, so->so_cbhSpoolFD, 0);
+    } else {
+	so->so_cbhHead = xmap(NULL, sizeof(CyclicBufferHead), PROT_READ|PROT_WRITE, MAP_SHARED, so->so_cbhSpoolFD, 0);
+    }
+    if (so->so_cbhHead->cbh_byteOrder!=CBH_BYTEORDER) {
+	logit(LOG_CRIT, "CycBuf : wrong byte order or file has not been initialize (%s)", path);
+	exit(1);
+    }
+    if (so->so_cbhHead->cbh_version!=CBH_VERSION) {
+	logit(LOG_CRIT, "CycBuf : wrong version, please update your buffer (%s)", path);
+	exit(1);
+    }
+
+    if (cbh.cbh_flnamelen!=0) { /* spool filename */
+
+	if (cbh.cbh_flnamelen>PATH_MAX) {
+	    logit(LOG_CRIT, "CycBuf : spool file name too long %s (%i/%i)", path, cbh.cbh_flnamelen, PATH_MAX);
+	    exit(1);
+	}
+	r = read(so->so_cbhSpoolFD, spth, cbh.cbh_flnamelen);
+	if (r!=cbh.cbh_flnamelen) {
+	    logit(LOG_CRIT, "CycBuf : short spool filename read %s (%i/%i)", path, r, cbh.cbh_flnamelen);
+	    exit(1);
+	}
+	if (romode) {
+	    so->so_cbhSpoolFD = open(spth, O_RDONLY);
+	} else {
+	    so->so_cbhSpoolFD = open(spth, O_RDWR);
+	}
+	if (so->so_cbhSpoolFD==-1) {
+	    logit(LOG_CRIT, "CycBuf : can not open spool file %s", spth);
+	    exit(1);
+	}
+    } else {
+	strncpy(spth, path, PATH_MAX);
+    }
+    if (so->so_cbhHead->cbh_flags&CBH_FLG_SPOOLMASK) {
+	if (so->so_SpoolNum != (so->so_cbhHead->cbh_flags & CBH_FLG_SPOOLMASK)) {
+	    logit(LOG_CRIT, "CycBuf : spool mismatch, %s is not spool %i (found spool %i)", path, so->so_SpoolNum, (so->so_cbhHead->cbh_flags & CBH_FLG_SPOOLMASK));
+	    exit(1);
+	}
+    	if (md5CycBuf(so, NULL)) {
+	    logit(LOG_CRIT, "CycBuf : wrong md5sum on spool %i (%s)", so->so_SpoolNum, spth);
+	    exit(1);
+	}
+    } else {
+	if (!romode) {
+	    so->so_cbhHead->cbh_flags = (so->so_cbhHead->cbh_flags & ~CBH_FLG_SPOOLMASK) | (so->so_SpoolNum & CBH_FLG_SPOOLMASK);
+	    logit(LOG_INFO, "CycBuf : affecting %s to spool %i and processing md5", path, so->so_SpoolNum);
+    	    md5CycBuf(so, &so->so_cbhHead->cbh_md5);
+	}
+    }
+}
+
+void
+addSpool(SpoolObject *so, int romode)
 {
     struct stat st;
     char *path;
@@ -429,6 +692,9 @@ addSpool(SpoolObject *so)
     if (so->so_SpoolNum > 0) {
 	SpoolObjectMap[so->so_SpoolNum] = so;
 	so->so_Next = NULL;
+	    if (so->so_ExpireMethod==SPOOL_EXPIRE_CYCLIC) {
+            so->so_SpoolDirs = 0;
+     	   }
     }
 
     if (!so->so_Path[0])
@@ -455,6 +721,15 @@ addSpool(SpoolObject *so)
 	    logit(LOG_CRIT, "%s: Missing spool partition %s",
 				PatLibExpand(DSpoolCtlPat), path);
 	    exit(1);
+	} else if (so->so_ExpireMethod==SPOOL_EXPIRE_CYCLIC) {
+	    if (S_ISBLK(st.st_mode)) {
+		openCycBuf(so, path, so->so_CPth, romode);
+	    } else if (S_ISREG(st.st_mode)) {
+		openCycBuf(so, path, so->so_CPth, romode);
+	    } else {
+	    	logit(LOG_CRIT, "CycBuf : unknown type %s", path);
+		exit(1);
+	    }
 	}
     }
 
@@ -534,6 +809,7 @@ findLabel(LabelList *ll, char *label)
 
 uint32 SpoolGmtMin = (uint32)-1;
 time_t SpoolMTime = 0;
+int SpoolRoMode = -1;
 
 #define	EXSTAT_NONE	0x00
 #define	EXSTAT_SPOOL	0x01
@@ -542,7 +818,29 @@ time_t SpoolMTime = 0;
 #define	EXSTAT_OVERVIEW	0x08
 
 void
-loadSpoolCtl(FILE *fi)
+cleanSpoolObjects(SpoolObject *so)
+{
+    while(so) {
+	if (so->so_ExpireMethod==SPOOL_EXPIRE_CYCLIC) {
+	    if (so->so_cbhHead) {
+		xunmap(so->so_cbhHead, sizeof(CyclicBufferHead));
+		so->so_cbhHead = NULL;
+	    }
+	    if (so->so_cbhHeadFD>-1 && so->so_cbhHeadFD!=so->so_cbhSpoolFD) {
+		close(so->so_cbhHeadFD);
+	    }
+	    so->so_cbhHeadFD = -1;
+	    if (so->so_cbhSpoolFD > -1) {
+		close(so->so_cbhSpoolFD);
+		so->so_cbhSpoolFD = -1;
+	    }
+	}
+	so = so->so_Next;
+    }
+}
+
+void
+loadSpoolCtl(FILE *fi, int romode)
 {
     char buf[MAXGNAME+256];
     int status = EXSTAT_NONE;
@@ -552,6 +850,7 @@ loadSpoolCtl(FILE *fi)
     MetaSpool *metaSpool = NULL;
     GroupExpire *expire = NULL;
 
+    cleanSpoolObjects(SpoolObjects);
     freePool(&SPMemPool);
     SpoolObjects = NULL;
     MetaSpools = NULL;
@@ -590,7 +889,7 @@ loadSpoolCtl(FILE *fi)
 	if (strcmp(cmd, "end") == 0) {
 	    switch (status) {
 		case EXSTAT_SPOOL:
-		     addSpool(spoolObj);
+		     addSpool(spoolObj, romode);
 		     spoolObj = NULL;
 		     break;
 		case EXSTAT_META:
@@ -629,6 +928,8 @@ loadSpoolCtl(FILE *fi)
 	    }
 	    status = EXSTAT_SPOOL;
 	    spoolObj->so_CompressLvl = -1;
+            spoolObj->so_cbhHeadFD = -1;
+            spoolObj->so_cbhSpoolFD = -1;
 	    spoolObj->so_Weight = -1;
 	    continue;
 	}
@@ -688,9 +989,11 @@ loadSpoolCtl(FILE *fi)
 		continue;
 	    } else if (strcmp(cmd, "expiremethod") == 0) {
 		if (strcmp(arg, "sync") == 0)
-		    spoolObj->so_ExpireMethod = 0;
+		    spoolObj->so_ExpireMethod = SPOOL_EXPIRE_SYNC;
 		else if (strcmp(arg, "dirsize") == 0)
-		    spoolObj->so_ExpireMethod = 1;
+		    spoolObj->so_ExpireMethod = SPOOL_EXPIRE_DIRSZ;
+		else if (strcmp(arg, "cyclic") == 0)
+		    spoolObj->so_ExpireMethod = SPOOL_EXPIRE_CYCLIC;
 		else  {
 		    logit(LOG_ERR, "%s: Unknown expiremethod '%s' in line %d",
 				PatLibExpand(DSpoolCtlPat), arg, line);
@@ -843,13 +1146,15 @@ loadSpoolCtl(FILE *fi)
  * NOTE: exit program if any errors
  */
 void
-LoadSpoolCtl(time_t gmt, int force)
+LoadSpoolCtl(time_t gmt, int force, int romode)
 {
     /*
      * check for dspool.ctl file modified once a minute
      */
 
     gmt = gmt / 60;
+    if (SpoolRoMode!=romode) force = 1;
+
     if (force || gmt != SpoolGmtMin) {
 	struct stat st = { 0 };
 
@@ -876,7 +1181,7 @@ LoadSpoolCtl(time_t gmt, int force)
 		if (force)
 		    fstat(fileno(fi), &st);
 		SpoolMTime = st.st_mtime; /* may be 0 if file failed to open */
-		loadSpoolCtl(fi);
+		loadSpoolCtl(fi, romode);
 	    }
 	    if (fi)
 		fclose(fi);
@@ -884,6 +1189,7 @@ LoadSpoolCtl(time_t gmt, int force)
 		dumpSpoolConfig();
 	}
     }
+    SpoolRoMode=romode;
 }
 
 /*

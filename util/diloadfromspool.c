@@ -26,6 +26,7 @@
   char *strptime(const char *s, const char *format, struct tm *tm);
 #endif
 
+#define _GNU_SOURCE
 int VerboseOpt;
 int QuietOpt;
 int LoadDupCount;
@@ -46,11 +47,12 @@ void ScanSpoolObject(uint16 spoolobj);
 void ScanSpool(uint16 spoolobj);
 void ScanSpoolDirectory(char *dpath, int gmt, uint16 spoolobj);
 void ScanSpoolFile(char *fpath, int gmt, int iter, uint16 spoolobj);
-void ScanSpoolFileMap(const char *base, int bytes, int gmt, int iter, char *dpath, uint16 spoolobj, int fd);
-void ScanSpoolFileMapOld(const char *base, int bytes, int gmt, int iter, char *dpath, uint16 spoolobj);
+void ScanSpoolFileMap(const char *base, off_t offset, off_t bytes, int gmt, int iter, char *dpath, uint16 spoolobj, int fd);
+void ScanSpoolFileMapOld(const char *base, off_t bytes, int gmt, int iter, char *dpath, uint16 spoolobj);
 void DoArticle(History *h, const char *id, char *nglist, char *dist,
 		char *npath, int headOnly, char *artType, char *cSize);
 int strSort(const void *s1, const void *s2);
+void ScanCycSpool(uint16 spoolnum);
 
 void
 Usage(void)
@@ -238,7 +240,7 @@ main(int ac, char **av)
 	}
     }
 
-    LoadSpoolCtl(0, 1);
+    LoadSpoolCtl(0, 1, 1);
 
     if (RequeueOpt) {
 	ForReal = 0;
@@ -317,42 +319,145 @@ ScanSpoolObject(uint16 spoolobj)
     for (i = GetFirstSpool(&spoolnum, &path, NULL, NULL, NULL, NULL, NULL); i;
 		i = GetNextSpool(&spoolnum, &path, NULL, NULL, NULL, NULL, NULL))  {
 	if (spoolobj == (uint16)-1 || spoolobj == spoolnum) {
-
-	    if (path == NULL || !*path)
-		continue;
-	    if (chdir(PatExpand(SpoolHomePat)) == -1 || chdir(path) == -1) {
-		fprintf(stderr, "Unable to chdir(%s/%s): %s\n",
+	    if (checkCycBufSpool(spoolnum)) {
+		ScanCycSpool(spoolnum);
+	    } else {
+		if (path == NULL || !*path)
+		    continue;
+		if (chdir(PatExpand(SpoolHomePat)) == -1 || chdir(path) == -1) {
+		    fprintf(stderr, "Unable to chdir(%s/%s): %s\n",
 				PatExpand(SpoolHomePat), path, strerror(errno));
-		exit(1);
-	    }
+		    exit(1);
+		}
 
-	    ScanSpool(spoolnum);
+		ScanSpool(spoolnum);
 
-	    /*
-	     * Sort directories
-	     */
-	    if (FileIdx > 1)
-		qsort(FileAry, FileIdx, sizeof(char *), strSort);
+		/*
+		 * Sort directories
+		 */
+		if (FileIdx > 1)
+		    qsort(FileAry, FileIdx, sizeof(char *), strSort);
 
-	    /*
-	     * Process directories
-	     */
-	    {
-		int i;
+		/*
+		 * Process directories
+		*/
+		{
+		    int i;
 
-		for (i = 0; i < FileIdx; ++i) {
-		    int gmt;
-		    char *p;
+		    for (i = 0; i < FileIdx; ++i) {
+			int gmt;
+			char *p;
 	
-		    p = strstr(FileAry[i], "D.");
-		    if (p && sscanf(p, "D.%x", &gmt) == 1) {
-			ScanSpoolDirectory(FileAry[i], gmt, spoolnum);
+			p = strstr(FileAry[i], "D.");
+			if (p && sscanf(p, "D.%x", &gmt) == 1) {
+			    ScanSpoolDirectory(FileAry[i], gmt, spoolnum);
+			}
 		    }
 		}
+		FileIdx = 0;
 	    }
-	    FileIdx = 0;
 	}
     }
+}
+
+void
+ScanCycSpoolPartial(SpoolObject *so, off_t pos, off_t end, uint32 gmt, uint16 cycle, off_t ref)
+{
+    char needle[] = { 0x00, STORE_MAGIC1, STORE_MAGIC2, STOREAPI_REVISION, sizeof(SpoolArtHdr) };
+    int bufsize=100*1024*1024;
+
+    while (pos < end) {
+	int size = bufsize+sizeof(SpoolArtHdr)+1;
+	int left, articles, corrupt;
+	char *ptr, *base, *start;
+	off_t startoff;
+
+	if (pos+size > so->so_cbhHead->cbh_size) size = so->so_cbhHead->cbh_size - pos;
+	base = ptr = xmap(NULL, size, PROT_READ, MAP_SHARED, so->so_cbhSpoolFD, pos);
+	xadvise(base, size, XADV_SEQUENTIAL);
+
+	/* as there should not be any \0 on spool excepted between articles, the
+	 * following search should work */
+	left = size;
+	if (pos==so->so_cbhHead->cbh_offset && memcmp(base, needle+1, sizeof(needle)-1)==0) {
+	    ptr = base-1;
+	} else {
+	    ptr = memmem(base, left, needle, sizeof(needle));
+	}
+	if (!ptr) {
+	    pos += bufsize;
+	    continue;
+	} else if (ptr!=base) {
+	    pos += ptr-base;
+	    left -= ptr-base;
+	}
+	start = ptr; startoff = pos;
+	articles = 0;
+	corrupt=0;
+	while(ptr && pos<end) {
+	    SpoolArtHdr *ah = ptr+1;
+	    int incr;
+	    char *t;
+
+	    if (ah->StoreLen > left) {
+		break;
+	    }
+	    if (*(ptr+ah->StoreLen)==0) {
+		articles++;
+		incr = ah->StoreLen;
+	    } else {
+		printf("corruption detected, seeking again\n");
+		printf("offset %llx length %x at %llx found %x", pos, ah->StoreLen, pos+ah->StoreLen, *(ptr+ah->StoreLen));
+		corrupt=1;
+		break;
+	    }
+	    pos += incr;
+	    left -= incr;
+	    /* I should not have to do this but we will be immune to sector/page
+	     * padding */
+	    ptr += incr;
+	    t = memmem(ptr, left, needle, sizeof(needle));
+	    if (ptr!=t) {
+		break;
+	    }
+	}
+	if (VerboseOpt>1)
+	    printf("%i articles were found\nScanSpoolFileMap base %x offset %lli size %i\n", articles, start+1, startoff+1, ptr-start);
+	if (articles)
+	    ScanSpoolFileMap(start+1, startoff+1, ptr-start, gmt, cycle, so->so_Path, so->so_SpoolNum, so->so_cbhSpoolFD);
+	if (!QuietOpt) {
+	    float prc;
+	    off_t spoolsize = so->so_cbhHead->cbh_size - so->so_cbhHead->cbh_offset;
+	    if (startoff>ref) {
+		prc = (pos-ref)*100.0/spoolsize;
+	    } else {
+		prc = (pos-so->so_cbhHead->cbh_offset+spoolsize-ref)*100.0/spoolsize;
+	    }
+	    printf(" (spool %02i done %6.2f%)\n", so->so_SpoolNum, prc);
+	}
+	if (corrupt) {
+	    pos += sizeof(needle); 
+	    left -= sizeof(needle);
+	}
+	xunmap(base, size);
+    }
+}
+
+void
+ScanCycSpool(uint16 spoolnum)
+{
+    SpoolObject *so;
+    off_t pos;
+    int cycle;
+    uint32 gmt = time(NULL)/60;
+
+    so = findSpoolObject(spoolnum);
+    pos = getCycBufPos(so, 0, &cycle, NULL);
+    if (!QuietOpt)
+	printf("spool %i is cyclic (file %s) pos %lli cycles %i\n", spoolnum, so->so_CPth, pos, cycle);
+   if (cycle>0)
+	ScanCycSpoolPartial(so, pos, so->so_cbhHead->cbh_size, gmt, (cycle-1)&0xffff, pos);
+    ScanCycSpoolPartial(so, so->so_cbhHead->cbh_offset, pos, gmt, cycle&0xffff, pos);
 }
 
 void
@@ -421,7 +526,7 @@ ScanSpoolFile(char *fpath, int gmt, int iter, uint16 spoolobj)
 {
     int fd;
     char *base;
-    int bytes;
+    off_t bytes;
     struct stat st;
 
     if (VerboseOpt)
@@ -451,7 +556,7 @@ ScanSpoolFile(char *fpath, int gmt, int iter, uint16 spoolobj)
 
     if (bytes > 2 && (uint8)*base == (uint8)STORE_MAGIC1 &&
 				(uint8)*(base + 1) == (uint8)STORE_MAGIC2)
-	ScanSpoolFileMap(base, bytes, gmt, iter, fpath, spoolobj, fd);
+	ScanSpoolFileMap(base, 0, bytes, gmt, iter, fpath, spoolobj, fd);
     else
 	ScanSpoolFileMapOld(base, bytes, gmt, iter, fpath, spoolobj);
 
@@ -462,10 +567,10 @@ ScanSpoolFile(char *fpath, int gmt, int iter, uint16 spoolobj)
 }
 
 void
-ScanSpoolFileMap(const char *base, int bytes, int gmt, int iter, char *dpath, uint16 spoolobj, int fd)
+ScanSpoolFileMap(const char *base, off_t offset, off_t bytes, int gmt, int iter, char *dpath, uint16 spoolobj, int fd)
 {
     int count = 0;
-    int b = 0;
+    off_t b = 0;
     int arthdrlen;
     char *artbase = NULL;
     char *artpos;
@@ -490,7 +595,7 @@ ScanSpoolFileMap(const char *base, int bytes, int gmt, int iter, char *dpath, ui
 
 	    artbase = (char *)malloc(ah.ArtLen + 2);
 	    bzero(artbase, ah.ArtLen + 2);
-	    lseek(fd, b + ah.HeadLen, 0);
+	    lseek(fd, offset + b + ah.HeadLen, 0);
 	    if ((gzf = gzdopen(dup(fd), "r")) != NULL) {
 		if (gzread(gzf, artbase, len) != len)
 		    arthdrlen = 0;
@@ -540,7 +645,7 @@ ScanSpoolFileMap(const char *base, int bytes, int gmt, int iter, char *dpath, ui
 	    h.iter = iter;
 	    h.gmt = gmt;
 	    h.exp = 100 + spoolobj;
-	    h.boffset = b;
+	    h.boffset = offset+b;
 	    h.bsize = ah.StoreLen - 1;
 	    headOnly = 0;
 	    if (ah.ArtHdrLen == ah.ArtLen) {
@@ -569,9 +674,9 @@ ScanSpoolFileMap(const char *base, int bytes, int gmt, int iter, char *dpath, ui
 }
 
 void
-ScanSpoolFileMapOld(const char *base, int bytes, int gmt, int iter, char *dpath, uint16 spoolobj)
+ScanSpoolFileMapOld(const char *base, off_t bytes, int gmt, int iter, char *dpath, uint16 spoolobj)
 {
-    int b = 0;
+    off_t b = 0;
     int count = 0;
 
     /*
@@ -695,7 +800,7 @@ DoArticle(History *h, const char *id, char *nglist, char *dist,
 	}
     }
     if (VerboseOpt > 1 || (VerboseOpt && r != 0))
-	printf("\tMessage %d,%d %s %s\n", h->boffset, h->bsize,
+	printf("\tMessage %lld,%d %s %s\n", h->boffset, h->bsize,
 				((r == 0) ? "dup" : "add"), id);
 }
 

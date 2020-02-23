@@ -314,6 +314,8 @@
  */
 #undef	BIG_MBUF
 
+#define USE_SENDFILE 1
+
 /*
  * MAXFORKS is the max # of incoming feeds - 512 by default.
  * MAXFEEDS is the max # of outgoing feeds - 128 by default.

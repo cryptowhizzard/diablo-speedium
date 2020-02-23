@@ -36,6 +36,10 @@
 #include <sys/termios.h>
 #endif
 
+#if USE_SENDFILE
+#include <sys/sendfile.h>
+#endif
+
 typedef struct Feed {
     struct Feed *fe_Next;
     char	*fe_Label;
@@ -60,6 +64,21 @@ typedef struct Track {
     char	addr[64];
 } Track;
 
+#define OpArtReg 0x0000;
+#define OpArtCyc 0x0001;
+
+struct OpArt {
+    int type;
+    char *data;
+    int fd;
+    int fdtoclose;
+    off_t offset;
+    int fsize;
+    int headOnly;
+    int compressed;
+    int pmart;
+} OpArt;
+
 #define RET_CLOSE	1
 #define RET_PAUSE	2
 #define RET_LOCK	3
@@ -79,12 +98,12 @@ void DoFeedNotify(FILE *fo, char *info);
 void DoListNotify(FILE *fo, char *l);
 void DoStats(FILE *fo, int dt, int raw);
 int LoadArticle(Buffer *bi, const char *msgid, int noWrite, int headerOnly, char *refBuf, char *artType);
-int SendArticle(const char *data, int fsize, FILE *fo, int doHead, int doBody);
+int SendArticle(struct OpArt *opa, int fd, FILE *fo, int doHead, int doBody);
 void ArticleFileInit(void);
 #ifdef USE_ZLIB
-int ArticleFile(History *h, off_t *pbpos, int clvl, gzFile *cfile);
+int ArticleFile(History *h, off_t *pbpos, int clvl, gzFile **cfile, int *cycles, int *flags);
 #else
-int ArticleFile(History *h, off_t *pbpos, int clvl, char **cfile);
+int ArticleFile(History *h, off_t *pbpos, int clvl, char **cfile, int *cycles, int *flags);
 #endif
 void ArticleFileCloseAll(void);
 void ArticleFileCacheFlush(time_t t);
@@ -106,7 +125,9 @@ void FeedAddDel(FILE *fo, char *gwild, int add);
 void FinishRetain(int what);
 int QueueRange(const char *label, int *pqnum, int *pqarts, int *pqrun);
 int countFds(fd_set *rfds);
-int ArticleOpen(History *h, const char *msgid, char **pfi, int32 *rsize, int *pmart, int *pheadOnly, int *compressed);
+int ArticleOpen(struct OpArt *opa, History *h, const char *msgid, int *locked, int dobody);
+void ArticleClose (struct OpArt *opa);
+void ArticleCheckFlag(History *h, int flag);
 
 void DoArtStats(int statgroup, int which, int bytes);
 void DoSpoolStats(int which);
@@ -155,7 +176,7 @@ char	PeerIpName[64];
 hash_t	PeerIpHash;
 int	HasStatusLine = 0;
 MemPool	*ParProcMemPool;
-int	ReadOnlyCxn = 0;		/* Read-only client connection */
+int	ReadOnlyCxn = -1;		/* RO by default but dspool.ctl will be reloaded */
 int	ReadOnlyMode = 0;		/* Server switched to RO mode */
 pid_t	HostCachePid = 0;
 time_t	SpoolAllocTime = 0;
@@ -860,7 +881,7 @@ DiabloServer(int lfd)
      * a label.
      */
 
-    LoadSpoolCtl(0, 1);		/* check spool partitions if specified */ 
+    LoadSpoolCtl(0, 1, ReadOnlyCxn);		/* check spool partitions if specified */ 
     LoadNewsFeed(0, 1, NULL);
 
     {
@@ -892,7 +913,7 @@ DiabloServer(int lfd)
 
 	t = time(NULL);
 
-	LoadSpoolCtl(t, 0);	/* check spool partitions if specified */ 
+	LoadSpoolCtl(t, 0, ReadOnlyCxn);	/* check spool partitions if specified */ 
 	LoadNewsFeed(t, 0, NULL);
 	if (HostCachePid == 0)
 	    HostCachePid = LoadHostAccess(t, 0, DOpts.HostCacheRebuildTime);
@@ -1714,10 +1735,13 @@ DoSession(int fd, int count)
     }
 
     LoadNewsFeed(0, 1, HLabel);	/* free old memory and load only our label */
+    ReadOnlyCxn = FeedReadOnly(HLabel);
+				/* force read-only?			   */
+    LoadSpoolCtl(time(NULL), 0, ReadOnlyCxn);	/* check spool partitions if specified */ 
 
     ConfigNewsFeedSockOpts(HLabel, nfd, fd);
 
-    if (ReadOnlyMode && !FeedReadOnly(HLabel)) {
+    if (ReadOnlyMode && !ReadOnlyCxn) {
 	xfprintf(fo, "502 %s DIABLO is currently in read-only mode\r\n",
 		DOpts.FeederHostName);
 	fflush(fo);
@@ -1756,8 +1780,6 @@ DoSession(int fd, int count)
     }
 
     ArticleFileInit();		/* initialize article file cache	   */
-    ReadOnlyCxn = FeedReadOnly(HLabel);
-				/* force read-only?			   */
 
     if ((DOpts.FeederActiveEnabled && (DOpts.FeederXRefSync || DOpts.FeederXRefSlave == 0)) || DOpts.FeederActiveDrop)
 	InitDActive(ServerDActivePat); /* initialize dactive.kp if enabled   */
@@ -2086,7 +2108,7 @@ DoSession(int fd, int count)
 		    ArticleFileName(path, sizeof(path), &h, ARTFILE_FILE_REL);
 		else
 		    ArticleFileName(path, sizeof(path), &h, ARTFILE_FILE);
-		xfprintf(fo, "223 0 whereis %s in %s offset %i length %i\r\n", msgid, path, h.boffset, h.bsize) ;
+		xfprintf(fo, "223 0 whereis %s in %s offset %lli length %i\r\n", msgid, path, h.boffset, h.bsize) ;
 	    } else {
 		if (H_EXPIRED(h.exp) && h.iter != (unsigned short)-1) {
 		    xfprintf(fo, "430 Article expired\r\n");
@@ -2115,27 +2137,28 @@ DoSession(int fd, int count)
 	) {
 	    const char *msgid = MsgId(strtok(NULL, " \t\r\n"), NULL);
 	    const char *fetchopt = strtok(NULL, " \t\r\n");
-	    char *data = NULL;
-	    int32 fsize = 0;
-	    int pmart = 0;
-	    int headOnly = 0;
-	    int compressed = 0;
 	    uint32 maxage = 0;
 	    int error = 0;
 	    History h;
+	    int doHead = 0;
+            int doBody = 0;
 	    enum ArtState { AS_ARTICLE, AS_BODY, AS_HEAD } as = AS_HEAD;
 
 	    switch(cmd[0]) {
 	    case 'b':
 	    case 'B':
 		as = AS_BODY;
+		doBody=1;
 		break;
 	    case 'a':
 	    case 'A':
 		as = AS_ARTICLE;
+		doBody=1;
+		doHead = 1;
 		break;
 	    default:	/* default, must be AS_HEAD */
 		as = AS_HEAD;
+		doHead=1;
 		break;
 	    }
 	    h.exp = 0;
@@ -2170,23 +2193,11 @@ DoSession(int fd, int count)
 		    break;
 		}
 	    } else if (HistoryLookup(msgid, &h) == 0 && !H_EXPIRED(h.exp)) {
-		if (ArticleOpen(&h, msgid, &data, &fsize, &pmart, &headOnly, &compressed) != 0)
-		    data = NULL;
-		if (maxage && maxage < ((int)(time(NULL)) - h.gmt * 60)) {
-		    xfprintf(fo, "430 Article prohibited\r\n");
-		    switch(as) {
-		    case AS_BODY:
-			DoSpoolStats(STATS_S_BODYPRO);
-			break;
-		    case AS_ARTICLE:
-			DoSpoolStats(STATS_S_ARTICLEPRO);
-			break;
-		    default:
-			DoSpoolStats(STATS_S_HEADPRO);
-			break;
-		    }
-		    data = NULL;
-		} else if (data && headOnly && as != AS_HEAD) {
+                int locked=-1;
+                struct OpArt opa;
+                if (ArticleOpen(&opa, &h, msgid, &locked, doBody) != 0)
+                    opa.data = NULL;
+                if (opa.data && opa.headOnly && as != AS_HEAD) {
 		    xfprintf(fo, "430 Article not found\r\n");
 		    switch(as) {
 		    case AS_BODY:
@@ -2201,9 +2212,7 @@ DoSession(int fd, int count)
 		    }
 		    if (DebugOpt > 2)
 			ddprintf(">> (NO DATA: BODY/ARTICLE REQUEST FOR HEADER-ONLY STORE)");
-		} else if (data) {
-		    int doHead = 0;
-		    int doBody = 0;
+		} else if (opa.data) {
 		    int bytes;
 
 #ifdef	STATS_ART_AGE
@@ -2213,31 +2222,22 @@ DoSession(int fd, int count)
 		    switch(as) {
 		    case AS_BODY:
 			xfprintf(fo, "222 0 body %s\r\n", msgid);
-			doBody = 1;
 			DoSpoolStats(STATS_S_BODY);
 			break;
 		    case AS_ARTICLE:
 			xfprintf(fo, "220 0 article %s\r\n", msgid);
-			doHead = 1;
-			doBody = 1;
 			DoSpoolStats(STATS_S_ARTICLE);
 			break;
 		    default:
-			doHead = 1;
 			xfprintf(fo, "221 0 head %s\r\n", msgid);
 			DoSpoolStats(STATS_S_HEAD);
 			break;
-		    }
-		    if (doBody && !compressed) {
-			if (DOpts.SpoolPreloadArt)
-			    xadvise(data, fsize, XADV_WILLNEED);
-			xadvise(data, fsize, XADV_SEQUENTIAL);
 		    }
 
 		    if (DebugOpt > 2)
 			ddprintf(">> (DATA)");
 
-		    bytes = SendArticle(data, fsize, fo, doHead, doBody);
+		    bytes = SendArticle(&opa, fd, fo, doHead, doBody);
 
 		    Stats.SpoolStats.ArtsBytesSent += (double)bytes;
 		    if (HostStats != NULL) {
@@ -2261,6 +2261,11 @@ DoSession(int fd, int count)
 		    if (DebugOpt > 2)
 			ddprintf(">> (NO DATA: UNABLE TO FIND ARTICLE)");
 		}
+
+		if (locked>=0) {
+		    lflock(locked, h.boffset, h.bsize+1, XLOCK_UN);
+		}
+		ArticleClose(&opa);
 	    } else {
 		if (H_EXPIRED(h.exp) && h.iter != (unsigned short)-1) {
 		    xfprintf(fo, "430 Article expired\r\n");
@@ -2289,12 +2294,6 @@ DoSession(int fd, int count)
 			break;
 		    }
 		}
-	    }
-	    if (data) {
-		if (compressed)
-		    free(data);
-		else
-		    xunmap(data, fsize + pmart);
 	    }
 	} else if (strcasecmp(cmd, "stat") == 0) {
 	    const char *msgid = MsgId(strtok(NULL, "\r\n"), NULL);
@@ -2536,13 +2535,15 @@ DoSession(int fd, int count)
  * Send a mmap'ed article to a FILE, doing conversion if necessary
  */
 int
-SendArticle(const char *data, int fsize, FILE *fo, int doHead, int doBody)
+SendArticle(struct OpArt *opa, int fd, FILE *fo, int doHead, int doBody)
 {
     int b;
     int i;
     int inHeader = 1;
     int bytes = 0;
     SpoolArtHdr ah;
+    char* data = opa->data;
+    int fsize = opa->fsize;
 
     bcopy(data, &ah, sizeof(ah));
 
@@ -2563,6 +2564,31 @@ SendArticle(const char *data, int fsize, FILE *fo, int doHead, int doBody)
 	    }
 	}
 	if (ah.StoreType & STORETYPE_WIRE) {
+          int b=0;
+#if USE_SENDFILE
+           off_t offset;
+
+           offset = opa->offset + (unsigned int)data - (unsigned int)opa->data;
+
+           fflush(fo);
+           b = sendfile(fd, opa->fd, &offset, fsize);
+           while(b!=-1 && b!=fsize) {
+               fsize -= b;
+               data += b;
+               b = sendfile(fd, opa->fd, &offset, fsize);
+           }
+           
+           if (b==-1) {
+               if ((errno==EINVAL)||(errno=ENOSYS)) {
+                   b = fwrite(data, fsize, 1, fo);
+               } else {
+                   logit(LOG_ERR, "sendfile failed with errno=%i (%s)", errno, strerror(errno));
+               }
+           }
+#else
+           b = fwrite(data, fsize, 1, fo);
+#endif
+
 	    if (doBody) {
 		return(fwrite(data, 1, fsize, fo));
 	    } else {
@@ -2572,7 +2598,7 @@ SendArticle(const char *data, int fsize, FILE *fo, int doHead, int doBody)
 		return(b + 3);
 	    }
 	}
-    } else if (*data == 0) {
+    } else if (data == 0) {
 	data++;
     }
 
@@ -2735,6 +2761,7 @@ LoadArticle(Buffer *bi, const char *msgid, int noWrite, int headerOnly, char *re
 	int bps;
 	int aflen = 0;
 	int headerLen = 0;
+	int cycles = -1;
 
 	struct timespec delay;
 	int delay_counter = 0;
@@ -3358,10 +3385,14 @@ LoadArticle(Buffer *bi, const char *msgid, int noWrite, int headerOnly, char *re
 	 * is set to a zero size on the spool, effectively deleting it
 	 */
 
+/*
+logit(LOG_CRIT, "LoadArticle3 : mid %s comp %i sat %i", msgid, CompressLvl, SpoolAllocTime);*/
+AllocateSpools(SpoolAllocTime); /* grmpf, something has to be fixed */
 	if (retcode == RCOK && !artError && buffer != NULL) {
 	    int interval = 0;
 	    char z = 0;
 	    uint16 spool = 0;
+	    int locksize = 0;
 
 	    h.exp = 0;
 	    spool = GetSpool(msgid, nglist, size, arttype, HLabel, &interval, &CompressLvl);
@@ -3379,6 +3410,7 @@ LoadArticle(Buffer *bi, const char *msgid, int noWrite, int headerOnly, char *re
 	    }
 	    h.gmt = SpoolDirTime();
 	    if (spool <= 100) {
+		int flag=0;
 #ifdef USE_ZLIB
 		gzFile cfile = NULL;
 #else
@@ -3386,9 +3418,8 @@ LoadArticle(Buffer *bi, const char *msgid, int noWrite, int headerOnly, char *re
 #endif
 		h.exp = spool + 100;
 		h.bsize = bsize(buffer) + sizeof(artHdr);
-		artFd = ArticleFile(&h, &bpos, CompressLvl, &cfile);
+		artFd = ArticleFile(&h, &bpos, CompressLvl, &cfile, &cycles, &flag);
 		if (artFd >= 0) {
-		    h.bsize = bsize(buffer) + sizeof(artHdr);
 		    artHdr.Magic1 = STORE_MAGIC1;
 		    artHdr.Magic2 = STORE_MAGIC2;
 		    artHdr.Version = STOREAPI_REVISION;
@@ -3400,6 +3431,11 @@ LoadArticle(Buffer *bi, const char *msgid, int noWrite, int headerOnly, char *re
 		    artHdr.ArtHdrLen = headerLen;
 		    artHdr.ArtLen = bsize(buffer);
 		    artHdr.StoreLen = h.bsize + 1;
+		    if(cycles!=-1) {
+			/* the data is locked after increasing buffer pos */
+			locksize = h.bsize+1;
+			lflock(artFd, bpos, locksize, XLOCK_EX);
+		    }
 		    write(artFd, &artHdr, sizeof(artHdr));
 		    bsetfd(buffer, artFd);
 #ifdef USE_ZLIB
@@ -3416,6 +3452,9 @@ LoadArticle(Buffer *bi, const char *msgid, int noWrite, int headerOnly, char *re
 		} else {
 		    artError |= LAERR_IO;
 		}
+	    if (flag) {
+		ArticleCheckFlag(&h, flag);
+	    }
 	    } else {
 		/*
 		 * This means we don't have metaspool object for this
@@ -3431,7 +3470,7 @@ LoadArticle(Buffer *bi, const char *msgid, int noWrite, int headerOnly, char *re
 	    /*
 	     * Write out the article
 	     */
-	    h.boffset = (uint32)bpos;
+	    h.boffset = bpos;
 #ifdef USE_ZLIB
 	    if (CompressLvl >= 0 && CompressLvl <= 9) {
 		off_t filePos;
@@ -3447,10 +3486,11 @@ LoadArticle(Buffer *bi, const char *msgid, int noWrite, int headerOnly, char *re
 #endif
 	    bwrite(buffer, &z, 1);		/* terminator (sanity check) */
 	    bflush(buffer);
+	    if(locksize) lflock(artFd, bpos, locksize, XLOCK_UN);
 	    if (DebugOpt > 1)
-		ddprintf("%s: b=%08lx artFd=%d boff=%d bsize=%d",
+		ddprintf("%s: b=%08lx artFd=%d boff=%lld bsize=%d",
 			msgid, (long)buffer, artFd,
-			(int)h.boffset, (int)h.bsize
+			(long long int)h.boffset, (int)h.bsize
 		);
 	}
 
@@ -3755,10 +3795,10 @@ LoadArticle(Buffer *bi, const char *msgid, int noWrite, int headerOnly, char *re
 	 * If we created a file but the return code is
 	 * not RCOK, truncate the file.
 	 */
-	if (artFd >= 0)
+	if (artFd >= 0 && cycles == -1)
 	    ArticleFileSetSize(artFd);
 
-	if (retcode != RCOK && artFd >= 0) {
+	if (retcode != RCOK && artFd >= 0 && cycles == -1) {
 	    ArticleFileTrunc(artFd, bpos);
 	}
     }
@@ -4477,13 +4517,27 @@ ArticleFileInit(void)
 
 int
 #ifdef USE_ZLIB
-ArticleFile(History *h, off_t *pbpos, int clvl, gzFile *cfile)
+ArticleFile(History *h, off_t *pbpos, int clvl, gzFile **cfile, int *cycles, int *flags)
 #else
-ArticleFile(History *h, off_t *pbpos, int clvl, char **cfile)
+ArticleFile(History *h, off_t *pbpos, int clvl, char **cfile, int *cycles, int *flags)
 #endif
 {
     AFCache	*af = NULL;
     int		rfd = -1;
+     SpoolObject        *so = NULL;
+ 
+     /* Look for cyclic buffer */
+     so = findSpoolObject(H_SPOOL(h->exp));
+     if (so && so->so_ExpireMethod==SPOOL_EXPIRE_CYCLIC) { 
+        off_t pos;
+        
+        pos = getCycBufPos(so, h->bsize, cycles, flags);
+        *pbpos = pos;
+        h->iter = *cycles & 0xffff;
+        if(pos>=0 && pos==lseek(so->so_cbhSpoolFD, pos, SEEK_SET)) {
+            return so->so_cbhSpoolFD;
+        }
+     }
 
     /*
      * Look for entry in cache.
@@ -4711,33 +4765,45 @@ ArticleFileSetSize(int artFd)
 }
 
 int
-MapArticle(int fd, char *fname, char **base, History *h, int *extra, int *artSize, int *compressedFormat)
+MapArticle(struct OpArt *opa, char *fname, History *h, int dobody)
 {
-    SpoolArtHdr tah = { 0 };
+     SpoolArtHdr tah;
+     char *tmpbase;
+ 
+     /* Any way, we mmap the file to avoid a disk seek */
+     tmpbase = xmap(NULL, h->bsize + 1, PROT_READ, MAP_SHARED, opa->fd, h->boffset);
+     if (tmpbase==NULL) {
+         logit(LOG_ERR, "Unable to mmap article header (%s)\n",
+                                                        strerror(errno));
+        return(-1);
+     }
+ 
+     /* preloading now */
+     if (dobody) {
+        if (DOpts.SpoolPreloadArt) {
+            xadvise(tmpbase, h->bsize + 1, XADV_WILLNEED);
+        } else {
+            xadvise(tmpbase, h->bsize + 1, XADV_SEQUENTIAL);
+        }
+     }
 
     /* 
      * Fetch the spool header for the article, this tells us how it was
      * stored 
      */
 
-    lseek(fd, h->boffset, 0);
-    if (read(fd, &tah, sizeof(SpoolArtHdr)) != sizeof(SpoolArtHdr)) {
-        close(fd);
-        logit(LOG_ERR, "Unable to read article header (%s)\n",
-							strerror(errno));
-        return(-1);
-    }
+    bcopy(tmpbase, &tah, sizeof(tah));
 
-    *compressedFormat = (tah.StoreType & STORETYPE_GZIP) ? 1 : 0;
+    opa->compressed = (tah.StoreType & STORETYPE_GZIP) ? 1 : 0;
 
-    if (*compressedFormat) {
+    if (opa->compressed) {
 #ifdef USE_ZLIB
 	gzFile gzf;
 	char *p;
 
 	if ((uint8)tah.Magic1 != STORE_MAGIC1 &&
 					(uint8)tah.Magic2 != STORE_MAGIC2) {
-	    lseek(fd, h->boffset, 0);
+	    lseek(opa->fd, h->boffset, 0);
 	    tah.Magic1 = STORE_MAGIC1;
 	    tah.Magic2 = STORE_MAGIC2;
 	    tah.HeadLen = sizeof(tah);
@@ -4746,132 +4812,147 @@ MapArticle(int fd, char *fname, char **base, History *h, int *extra, int *artSiz
 	    tah.StoreLen = h->bsize;
 	    tah.StoreType = STORETYPE_GZIP;
 	}
-	gzf = gzdopen(dup(fd), "r");
+	/* as we have mmaped the article, we should use inflate instead of
+	 * gzdopen/gzread */
+	gzf = gzdopen(dup(opa->fd), "r");
 	if (gzf == NULL) {
 	    logit(LOG_ERR, "Error opening compressed article\n");
+	    xunmap(tmpbase, h->bsize+1);
 	    return(-1);
 	}
-    	*base = (char *)malloc(tah.ArtLen + tah.HeadLen + 2);
-	if (*base == NULL) {
+    	opa->data = (char *)malloc(tah.ArtLen + tah.HeadLen + 2);
+	if (opa->data == NULL) {
 	    logit(LOG_CRIT, "Unable to malloc %d bytes for article (%s)\n",
 				tah.ArtLen + tah.HeadLen + 2, strerror(errno));
 	    gzclose(gzf);
+	    xunmap(tmpbase, h->bsize+1);
 	    return(-1);
 	}
-	p = *base;
+	p = opa->data;
 	bcopy(&tah, p, tah.HeadLen);
 	p += tah.HeadLen;
 	if (gzread(gzf, p, tah.ArtLen) != tah.ArtLen) {
 	    logit(LOG_ERR, "Error uncompressing article\n");
-	    free(*base);
+	    free(opa->data);
+	    opa->data=NULL;
+	    xunmap(tmpbase, h->bsize+1);
 	    return(-1);
 	}
 	
 	p[tah.ArtLen] = 0;
-	*artSize = tah.ArtLen + tah.HeadLen;
-	*compressedFormat = 1;
+	opa->fsize = tah.ArtLen + tah.HeadLen;
+	opa->compressed = 1;
 	gzclose(gzf);
 #else
         logit(LOG_ERR, "Article was stored compressed and compression support has not been enabled\n");
 #endif
+	xunmap(tmpbase, h->bsize+1);
     } else {
-	    *base = xmap(
-		NULL, 
-		h->bsize + 1, 
-		PROT_READ,
-		MAP_SHARED, 
-		fd, 
-		h->boffset
-	    );
-	    *artSize = h->bsize;
+	    opa->data = tmpbase;
+	    opa->fsize = h->bsize;
+	    opa->offset = h->boffset;
     }
 
-    if (*base == NULL) {
-	logit(LOG_ERR, "Unable to map file %s: %s (%d,%d,%d)\n",
-					fname,
-					strerror(errno),
-					(int)(h->boffset - *extra),
-					 (int)(h->bsize + *extra + 1),
-					*extra
-	);
-	*artSize = 0;
-	return(-1);
-    }
     return(0);
 }
 
 int
-ArticleOpen(History *h, const char *msgid, char **pfi, int32 *rsize, int *pmart, int *pheadOnly, int *compressed)
+ArticleOpen(struct OpArt *opa, History *h, const char *msgid, int *locked, int dobody)
 {
+    char path[PATH_MAX];
     int r = -1;
-    int z = 0;
+    SpoolObject *so = NULL;
 
-    if (pheadOnly)
-	*pheadOnly = (int)(h->exp & EXPF_HEADONLY);
+    opa->type = OpArtReg;
+    opa->data = NULL;
+    opa->fd = -1;
+    opa->fdtoclose = -1;
+    opa->fsize = 0;
+    opa->pmart = 1;
 
-    if (compressed != NULL) {
-	if (SpoolCompressed(H_SPOOL(h->exp)))
-	    *compressed = 1;
-	else
-	    *compressed = 0;
-    } else {
-	compressed = &z;
-    }
+    opa->headOnly = (int)(h->exp & EXPF_HEADONLY);
+
+    if (SpoolCompressed(H_SPOOL(h->exp)))
+	opa->compressed = 1;
+    else
+	opa->compressed = 0;
 	
-    if (pfi) {
-	char path[PATH_MAX];
-	int fd;
+    /*
+     * multi-article file ?  If so, articles are zero-terminated
+     */
 
+    /* Look for cyclic buffer */
+    so = findSpoolObject(H_SPOOL(h->exp));
+    if (so && so->so_ExpireMethod==SPOOL_EXPIRE_CYCLIC && so->so_cbhSpoolFD !=-1) {
+	opa->type = OpArtCyc;
+	opa->fd = so->so_cbhSpoolFD;
+	if (opa->fd >= 0) {
+	    if (lockCycBufArt(so, h, locked)==0) {
+		r = MapArticle(opa, path, h, dobody);
+	    }
+	}
+    } else {
 	ArticleFileName(path, sizeof(path), h, ARTFILE_FILE);
-
-	/*
-	 * multi-article file ?  If so, articles are zero-terminated
-	 */
-
-	*pfi = NULL;
-	*rsize = 0;
-	*pmart = 1;
 
 	/*
 	 * get the file
 	 */
-	if ((fd = cdopen(path, O_RDONLY, 0)) >= 0) {
-	    r = MapArticle(fd, path, pfi, h, pmart, rsize, compressed);
-
-	    /*
-	     * Sanity check.  Look for 0x00 guard character, make sure
-	     * first char isn't 0x00, and make sure last char isn't 0x00
-	     * (the last character actually must be an LF or the NNTP
-	     * protocol wouldn't have worked).
-	     */
-	    if (*pfi == NULL ||
-			h->bsize == 0 ||
-			(*pfi)[0] == 0 ||
-			(*pfi)[*rsize-1] == 0 ||
-			(*pfi)[*rsize] != 0
-	    ) {
-		logit(LOG_ERR, "corrupt spool entry for %s@%d,%d %s",
+	opa->fd = cdopen(path, O_RDONLY, 0);
+	opa->fdtoclose = opa->fd;
+	if (opa->fd >= 0) {
+	    r = MapArticle(opa, path, h, dobody);
+	}
+    }
+    if (r!=-1) {
+	/*
+	 * Sanity check.  Look for 0x00 guard character, make sure
+	 * first char isn't 0x00, and make sure last char isn't 0x00
+	 * (the last character actually must be an LF or the NNTP
+	 * protocol wouldn't have worked).
+	 */
+	if (opa->data == NULL || h->bsize == 0 ||
+		opa->data[0] == 0 || opa->data[opa->fsize-1] == 0
+		|| opa->data[opa->fsize] != 0
+	) {
+	    logit(LOG_ERR, "corrupt spool entry for %s@%lli,%d %s",
 		    path,
-		    (int)h->boffset,
+		    (long long int)h->boffset,
 		    (int)h->bsize,
 		    msgid
-		);
-		if (*pfi) {
-		    if (*compressed)
-			free(*pfi);
-		    else
-			xunmap(*pfi, *rsize);
-		    *pfi = NULL;
-		}
-	    } 
-		
+	    );
+	    if (opa->data==NULL) {
+		logit(LOG_ERR, "data is NULL");
+	    } else {
+		logit(LOG_ERR, "data %i data0 %i data1 %i data2 %i",
+		    opa->data, opa->data[0], opa->data[opa->fsize-1], opa->data[opa->fsize]);
+	    }
+	    if (opa->data) {
+		if (opa->compressed)
+		    free(opa->data);
+		else
+		    xunmap(opa->data, opa->fsize);
+		opa->data = NULL;
+	    }
 	}
-	if (fd != -1)
-	    close(fd);
     }
-   if (pfi && *pfi)
+   if (opa->data)
 	r = 0;
     return(r);
+}
+
+void
+ArticleClose (struct OpArt *opa) {
+    if (opa->data) {
+	if (opa->compressed)
+	    free(opa->data);
+	else
+	    xunmap(opa->data, opa->fsize + opa->pmart);
+	opa->data = NULL;
+    }
+    if (opa->fdtoclose != -1) {
+	close(opa->fdtoclose);
+	opa->fdtoclose = -1;
+    }
 }
 
 void
@@ -4915,6 +4996,18 @@ DoSpoolStats(int which) {
 	LockFeedRegion(HostStats, XLOCK_EX, FSTATS_SPOOL);
 	++HostStats->SpoolStats.Arts[which];
 	LockFeedRegion(HostStats, XLOCK_UN, FSTATS_SPOOL);
+    }
+}
+
+void
+ArticleCheckFlag(History *h, int flag)
+{
+    SpoolObject *so = NULL;
+
+    so = findSpoolObject(H_SPOOL(h->exp));
+
+    if (flag&CBH_WRAPPED) {
+	md5CycBuf(so, &so->so_cbhHead->cbh_md5);	/* MD5 update */
     }
 }
 

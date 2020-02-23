@@ -123,7 +123,7 @@ ScanSeq(char *name, char *host, int m)
 	printf("%-10s bad sequencing: %s\n", name, path);
 	return;
     }
-    printf("%-10s %5d-%-5d (%3d/%3d files %3d%% full)\t",
+    printf("%-18s %6d-%-6d (%3d/%3d files %3d%% full)\t",
 	name,
 	b,
 	e,

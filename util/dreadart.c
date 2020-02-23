@@ -105,7 +105,7 @@ main(int ac, char **av)
 	Usage(av[0]);
 
     HistoryOpen(NULL, HGF_READONLY);
-    LoadSpoolCtl(0, 1);
+    LoadSpoolCtl(0, 1, 1);
 
     if (arg == NULL) {
 	char buf[8192];
@@ -119,7 +119,7 @@ main(int ac, char **av)
 
 		if (strncmp(buf, "DUMP ", 5) == 0) {
 		    History h = { 0 };
-		    if (sscanf(buf + 5, "%s gm=%d ex=%hd boff=%d bsize=%d",
+		    if (sscanf(buf + 5, "%s gm=%d ex=%hd boff=%lld bsize=%d",
 					msgid, &h.gmt, &h.exp,
 					&h.boffset, &h.bsize) == 5) {
 			char *p;
@@ -175,7 +175,7 @@ main(int ac, char **av)
 		sprintf(p, "%s/", PatExpand(SpoolHomePat));
 		p += strlen(p);
 	    }
-	    if (sscanf(arg, "%[^:]:%d,%d", p, &h.boffset, &h.bsize) == 3) {
+	    if (sscanf(arg, "%[^:]:%lld,%d", p, &h.boffset, &h.bsize) == 3) {
 		DumpArticle(fname, &h, NULL);
 	    } else {
 		printf("Unknown argument: %s\n", arg);

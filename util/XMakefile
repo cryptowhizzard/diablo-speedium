@@ -7,7 +7,7 @@
 		dreadover dpath dprimehostcache dstart dclient \
 		dfeedinfo dlockhistory dfeedtest doverctl drequeue \
 		dhisbench dhisexpire dhisctl dexpirecache dcancel \
-		dexpirescoring
+		dexpirescoring dinitcycbuf dcbinfo dcycheadupdate
 .set SPROGS	diablo dnewslink dgrpctl
 .set SRCS	$(PROGS:"*":"*.c") $(SPROGS:"*":"*.c")
 .set OBJS	$(PROGS:"*":"$(BD)obj/util_*.o") $(SPROGS:"*":"$(BD)obj/util_*.o")

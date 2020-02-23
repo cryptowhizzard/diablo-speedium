@@ -136,7 +136,7 @@ main(int ac, char **av)
 	Usage();
     if (HistoryCancel || SpoolCancel) {
 	HistoryOpen(NULL, 0);
-	LoadSpoolCtl(0, 1);
+	LoadSpoolCtl(0, 1, 1);
     }
 
     if (inputFile == NULL)
@@ -529,7 +529,7 @@ rewriteFile(HistoryList *hl_file)
 	if (copyArt) {
 	    h.boffset = lseek(newf, 0, 1);
 	    if (compressed) {
-	        printf("Copying article at offset %lld to offset %d\n",
+	        printf("Copying article at offset %lld to offset %lld\n",
 					(long long)filepos, h.boffset);
 		lseek(oldf, filepos, SEEK_SET);
 		read(oldf, artBuf, artHdr.StoreLen);

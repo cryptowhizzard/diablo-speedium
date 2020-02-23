@@ -11,6 +11,7 @@
 
 Prototype int xflock(int fd, int flags);
 Prototype int hflock(int fd, off_t offset, int flags);
+Prototype int lflock(int fd, off_t offset, off_t len, int flags);
 
 /*
  * xflock() - a global lock.  
@@ -46,6 +47,12 @@ xflock(int fd, int flags)
 int 
 hflock(int fd, off_t offset, int flags)
 {
+    return(lflock(fd, offset, 4, flags));
+}
+
+int 
+lflock(int fd, off_t offset, off_t len, int flags)
+{
     int r;
     struct flock fl = { 0 };
 
@@ -62,7 +69,7 @@ hflock(int fd, off_t offset, int flags)
     }
     fl.l_whence = SEEK_SET;
     fl.l_start = offset;
-    fl.l_len = 4;
+    fl.l_len = len;
 
     r = fcntl(fd, ((flags & XLOCK_NB) ? F_SETLK : F_SETLKW), &fl);
     if (DebugOpt > 4)

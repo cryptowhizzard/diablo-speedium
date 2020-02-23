@@ -382,12 +382,12 @@ historyReOpen(void)
 void
 PrintHistory(History *h)
 {
-    printf(" [hv=%08x.%08x gm=%d ex=%d off=%d len=%d F=%s]\n",
+    printf(" [hv=%08x.%08x gm=%d ex=%d off=%lld len=%d F=%s]\n",
 		h->hv.h1,
 		h->hv.h2,
 		(int)h->gmt,
 		(int)h->exp,
-		(int)h->boffset,
+		(long long int)h->boffset,
 		(int)h->bsize,
 		((h->exp & EXPF_HEADONLY) ? "H" : "")
     );

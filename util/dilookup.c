@@ -78,7 +78,7 @@ main(int ac, char **av)
 	Usage();
 
     HistoryOpen(NULL, HGF_READONLY);
-    LoadSpoolCtl(0, 1);
+    LoadSpoolCtl(0, 1, 1);
 
     if (ScanOpt == 0) {
 	r += DILookup(id);
@@ -188,7 +188,7 @@ DILookup(char *id)
 
 	if (h.boffset || h.bsize) {
 	    ArticleFileName(buf, sizeof(buf), &h, ARTFILE_FILE_REL);
-	    printf(" [%s hv=%08x.%08x spool=%02x gm=%d ex=%d off=%d len=%d f=%s]"
+	    printf(" [%s hv=%08x.%08x spool=%02x gm=%d ex=%d off=%lld len=%d f=%s]"
 		   " GM=(%s) EX=(%s)\n",
 		buf,
 		h.hv.h1,
@@ -196,7 +196,7 @@ DILookup(char *id)
 		(int)H_SPOOL(h.exp),
 		(int)h.gmt,
 		(int)h.exp,
-		(int)h.boffset,
+		(long long int)h.boffset,
 		(int)h.bsize,
 		((h.exp & EXPF_HEADONLY) ? "H" : ""),
 		tbuf1,

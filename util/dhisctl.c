@@ -24,6 +24,7 @@ int DoAll = 0;
 int ForReal = 1;
 int StructSizes = 0;
 int HistoryHead = 0;
+int HistoryInfo = 0;
 
 void DumpHeader(int fd);
 void DoEntry(char *msgid);
@@ -45,6 +46,7 @@ Usage(void)
     printf("\t-e\t- expire the article(s)\n");
     printf("\t-f\t- file containing list of msgid's or '-' for stdin\n");
     printf("\t-h\t- display history header and total size details\n");
+    printf("\t-i\t- display history entry informations\n");
     printf("\t-p\t- show progress on stdout\n");
     printf("\t-S\t- display sizes of internal history structures and exit\n");
     printf("\t-u\t- unexpire the article(s)\n");
@@ -101,6 +103,9 @@ main(int ac, char **av)
 	    break;
 	case 'h':
 	    HistoryHead = 1;
+	    break;
+	case 'i':
+	    HistoryInfo = 1;
 	    break;
 	case 'p':
 	    ShowProgress = 1;
@@ -245,6 +250,15 @@ DoEntry(char *msgid)
     if (pos == -1) {
 	fprintf(stderr, "History lookup failed for %s\n", msgid);
 	return;
+    }
+    if (HistoryInfo) {
+	printf("Article %s :\n", msgid);
+	printf("\thash : %x.%x\n", hv.h1, hv.h2);
+	printf("\tinfo : ");
+	if (h.exp & EXPF_HEADONLY) printf("header-only ");
+	if (h.exp & EXPF_EXPIRED) printf("expired");
+	printf("(%i)\n", h.exp);
+	printf("\tspool %i offset %lli size %i iter %i\n", H_SPOOL(h.exp), h.boffset, h.bsize, h.iter);
     }
     if (FixEntry(&h, msgid) && ForReal)
 	HistoryStoreExp(&h, (HistIndex)pos);

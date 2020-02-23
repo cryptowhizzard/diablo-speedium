@@ -333,7 +333,7 @@ CleanAllSpools(void)
     SpoolEntries = malloc(entryMax * sizeof(SpoolEnt *));
     entryIdx = 0;
      
-    LoadSpoolCtl(0, 1);
+    LoadSpoolCtl(0, 1, 1);
 
     /*
      * Open and get a copy of the history file size before we scan the spools
@@ -375,12 +375,17 @@ CleanAllSpools(void)
 	double minfree = 0.0;
 	long minfreefiles = 0;
 	long keeptime = 0;
-	int expmethod = EXM_SYNC;
+	int expmethod = SPOOL_EXPIRE_SYNC;
 	
 	for (i = GetFirstSpool(&spoolnum, &path, &maxsize, &minfree, &minfreefiles, &keeptime, &expmethod); i;
 		i = GetNextSpool(&spoolnum, &path, &maxsize, &minfree, &minfreefiles, &keeptime, &expmethod))  {
 	    if (SinglePart && *SinglePart != spoolnum)
 		continue;
+	    if (expmethod==SPOOL_EXPIRE_CYCLIC) {
+		if (VerboseOpt)
+		    printf("Spool Object: %02d (cyclic buffer, no expire)\n", spoolnum);
+		continue;
+	    }
 	    {
 		Partition *p = (Partition *)malloc(sizeof(Partition));;
 	
@@ -396,17 +401,17 @@ CleanAllSpools(void)
 		p->minfreefiles = minfreefiles;
 		p->maxsize = maxsize;
 		p->keeptime = keeptime;
+		p->spaceok = 0;
 		if (UseDirSize)
-		    p->expmethod = EXM_DIRSIZE;
+		    p->expmethod = SPOOL_EXPIRE_DIRSZ;
 		else
 		    p->expmethod = expmethod;
-		p->spaceok = 0;
 		p->filesys = findFileSys(p->partname);
-		p->next = Partitions;
-		Partitions = p;
 		if (FreeSpaceTargetList[spoolnum] > 0.0)
 		    p->minfree = FreeSpaceTargetList[spoolnum];
 		scanDirectory(p);
+		p->next = Partitions;
+		Partitions = p;
 	    }
 	}
     }
@@ -633,6 +638,8 @@ cleanupDirectories(void)
 	part = SpoolEntries[i]->partn;
 	if (part->spaceok)
 	    continue;
+	if (part->filesys==NULL)
+	    continue;
 
 	spacefree = part->filesys->fsfree;
 	freefiles = part->filesys->fsfreefiles;
@@ -660,7 +667,7 @@ cleanupDirectories(void)
 	    if (part->minfreefiles)
 		printf("\tfreefiles=%ld/%ld\n", freefiles, part->minfreefiles);
 	    printf("\texpire method %s",
-			(part->expmethod == EXM_SYNC) ? "sync" : "dirsize");
+			(part->expmethod == SPOOL_EXPIRE_SYNC) ? "sync" : "dirsize");
 
 	}
 	if (part->minfree && spacefree < part->minfree)
@@ -705,7 +712,7 @@ cleanupDirectories(void)
 	    UpdateHistory = 1;
 	part->filesys->fsfree += remsize;
 	part->filesys->fsfreefiles += c;
-	if (part->expmethod == EXM_DIRSIZE || part->maxsize) {
+	if (part->expmethod == SPOOL_EXPIRE_DIRSZ || part->maxsize) {
 	    SpoolEntries[i]->dirsize = remsize;
 	    part->partsize -= remsize;
 	} else if (!NotForReal && (part->minfree || part->minfreefiles))
@@ -714,7 +721,7 @@ cleanupDirectories(void)
 	if (i + 1 < entryIdx)
 	    part->age = TimeNow - getAge(SpoolEntries[i + 1]->dirname);
 	if (VerboseOpt) {
-	    if (part->expmethod == EXM_DIRSIZE || part->maxsize)
+	    if (part->expmethod == SPOOL_EXPIRE_DIRSZ || part->maxsize)
 		printf("     Removed %s (used: %s free: %s age: %s)\n",
 					ftos(remsize),
 					ftos(part->partsize),
@@ -788,6 +795,11 @@ scanDirectory(Partition *scanpart)
     if (DebugOpt > 1)
 	printf("Scanning directory: %s\n", scanpart->partname);
 
+    if (scanpart->expmethod==SPOOL_EXPIRE_CYCLIC) {
+	if (DebugOpt > 1)
+	    printf("\tcyclic buffer\n");
+	return;
+    }
     if ((dir = opendir(scanpart->partname)) == NULL) {
 	fprintf(stderr, "Unable to scan directory: %s (%s)\n",
 				scanpart->partname, strerror(errno));
@@ -850,7 +862,7 @@ scanDirectory(Partition *scanpart)
 		SpoolEntries[entryIdx]->dirsize = 0.0;
 		SpoolEntries[entryIdx]->dirname = strdup(den->d_name);
 
-		if (scanpart->expmethod == EXM_DIRSIZE || scanpart->maxsize) {
+		if (scanpart->expmethod == SPOOL_EXPIRE_DIRSZ || scanpart->maxsize) {
 		    SpoolEntries[entryIdx]->dirsize =
 				findSize(scanpart->partname, den->d_name);
 		    scanpart->partsize += SpoolEntries[entryIdx]->dirsize;
@@ -969,6 +981,8 @@ updateHistory(void)
 
 	if (SpoolEntries[i]->removed)
 	    continue;
+	if (SpoolEntries[i]->partn->filesys==NULL)
+	    continue;
 
 	partnameLen = strlen(SpoolEntries[i]->partn->partname);
 
@@ -1067,7 +1081,7 @@ updateHistory(void)
 		h = &hist[i];
 		path[0] = 0;
 
-		if (TestOpt) {
+		if (TestOpt && !checkCycBufSpool(H_SPOOL(h->exp))) {
 		    int res;
 
 		    ArticleFileName(path, sizeof(path), h, ARTFILE_DIR_REL);
@@ -1113,35 +1127,52 @@ updateHistory(void)
 		if (h->hv.h1 == 0 && h->hv.h2 == 0)
 		    continue;
 
-		if (!UnexpireOpt)
-		    ArticleFileName(path, sizeof(path), h, ARTFILE_DIR_REL);
+		{
+		    int updated=0;
 
-		if (UnexpireOpt || findNode(path, 0) < 0) {
-		    if (!UnexpireOpt && VerboseOpt > 1) {
-			printf("Unable to find path %s (%08x.%08x), %s history record\n",
-			    path,
-			    h->hv.h1, h->hv.h2,
-			    ((HistoryUpdateOpt != 2) ? "expiring" : "would expire")
-			);
+		    if (UnexpireOpt) {
+			updated = 1;
+			h->exp &= ~EXPF_EXPIRED;
+		    } else if(checkCycBufSpool(H_SPOOL(h->exp))) {
+			if (checkCycBufBounds(findSpoolObject(H_SPOOL(h->exp)), h)) {
+			    if (VerboseOpt > 1) {
+				printf("Cyclic buffer %i overwriten (%08x.%08x), %s history record\n",
+				    H_SPOOL(h->exp), h->hv.h1, h->hv.h2,
+				    ((HistoryUpdateOpt != 2) ? "expiring" : "would expire")
+				);
+			    }
+			    if (HistoryUpdateOpt != 2) {
+				updated = 1;
+				h->exp |= EXPF_EXPIRED;
+			    }
+			}
+		    } else {
+			ArticleFileName(path, sizeof(path), h, ARTFILE_DIR_REL);
+
+			if (findNode(path, 0) < 0) {
+			    if (VerboseOpt > 1) {
+				printf("Unable to find path %s (%08x.%08x), %s history record\n",
+				    path, h->hv.h1, h->hv.h2,
+				    ((HistoryUpdateOpt != 2) ? "expiring" : "would expire")
+				);
+			    }
+			    if (HistoryUpdateOpt != 2) {
+				updated = 1;
+				h->exp |= EXPF_EXPIRED;
+			    }
+			}
 		    }
-		    if (UnexpireOpt || HistoryUpdateOpt != 2) {
+		    if (updated) {
+			++countExp;
 			changed = 1;
-			if (UnexpireOpt)
-			    h->exp &= ~EXPF_EXPIRED;
-			else
-			    h->exp |= EXPF_EXPIRED;
-			lseek(
-			    HistoryFd,
-			    bpos + sizeof(History) * i + offsetof(History, exp),
-			    0
-			);
+
+			lseek(HistoryFd, bpos + sizeof(History) * i + offsetof(History, exp), 0);
 			if (!NotForReal)
 			    write(HistoryFd, &h->exp, sizeof(h->exp));
 
 			if (WriteHashesToFileOpt == 1)
 			    fwrite(&h->hv, sizeof(hash_t), 1, DExpOverList);
 		    }
-		    ++countExp;
 		}
 	    }
 	    if (changed)

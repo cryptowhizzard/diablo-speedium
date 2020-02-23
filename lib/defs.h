@@ -284,7 +284,7 @@ typedef struct HistHead {
 
 #define HMAGIC		((uint32)0xA1B2C3D4)
 #define HDEADMAGIC	((uint32)0xDEADF5E6)
-#define HVERSION	2
+#define HVERSION	3
 
 /*
  * Dreaderd cache scoreboard
@@ -347,7 +347,7 @@ typedef struct History {
     hash_t	hv;		/* hash value			*/
     uint16 	iter;		/* file id 			*/
     uint16	exp;		/* hours relative to gmt minutes */
-    uint32	boffset;	/* starting offset in file	*/
+    off_t	boffset;	/* starting offset in file	*/
     int32	bsize;		/* size of article		*/
 } History;
 
@@ -506,7 +506,7 @@ typedef struct Node {
 #define MAXMSGIDLEN	250
 #define MAXGNAME	256
 #ifndef	MAXFORKS
-#define MAXFORKS	512
+#define MAXFORKS	1024
 #endif
 #ifndef	MAXFEEDS
 #define MAXFEEDS	128
@@ -546,8 +546,37 @@ typedef struct GroupList {
 /*
  * Expire methods
  */
-#define EXM_SYNC		0
-#define EXM_DIRSIZE		1
+#define SPOOL_EXPIRE_SYNC	0x00	/* sync, default */
+#define SPOOL_EXPIRE_DIRSZ	0x01	/* dirsize */
+#define SPOOL_EXPIRE_CYCLIC	0x80	/* cyclic buffer */
+
+#define CBH_BYTEORDER		0xd1c2b3a4
+#define CBH_VERSION		0x00000002 /* :-) */
+
+#define CBH_FLG_NOACCESS	0x80000000
+#define CBH_FLG_SPOOLMASK	0x000000ff /* spool */
+
+#define CBH_MD5_BUFSIZE		512	/* the spool MD5SUM is computed on the first 512 bytes */
+#define CBH_WRAPPED		0x00000001 /* the spool has wrapped */
+
+typedef struct CyclicBufferHead {
+    int			cbh_version;
+    int			cbh_byteOrder;
+    off_t		cbh_offset;	/* space kept for file header */
+    off_t		cbh_size;	/* file size */
+    off_t		cbh_pos;	/* position inside the cyclic buffer,
+					 * starting at cbh_offset */
+    int			cbh_cycles;	/* to expire history */
+    int			cbh_flnamelen;
+    time_t		cbh_stime;	/* for stat needs */
+    off_t		cbh_spos;
+    int			cbh_scycles;
+    int			cbh_flags;
+    md5hash_t		cbh_md5;
+    /* if the buffer head is stored in a dedicated file, cbh_flnamelen will be
+     * set to the buffer filename len and this filename will be stored just
+     * after this struct */
+} CyclicBufferHead;
 
 typedef struct SpoolObject {
     uint16		so_SpoolNum;
@@ -559,8 +588,12 @@ typedef struct SpoolObject {
     int			so_SpoolDirs;
     int			so_ExpireMethod;
     int			so_CompressLvl;
+    int                 so_cbhHeadFD;
+    struct 		CyclicBufferHead *so_cbhHead;
+    int                 so_cbhSpoolFD;
     int			so_Weight;
     char		so_Path[PATH_MAX];
+    char		so_CPth[PATH_MAX];
     struct SpoolObject	*so_Next;
 } SpoolObject;
 

@@ -207,7 +207,7 @@ main(int ac, char **av)
 	printf("\tSpam: %s\n", Spam ? "Yes" : "No");
 	if (SpoolMatch) {
 	    uint16 Spool;
-	    LoadSpoolCtl(0, 1);
+	    LoadSpoolCtl(0, 1, 1);
 	    AllocateSpools(0);
 	    Spool = GetSpool(MessageId, Newsgroups, atoi(Size),
                         ArtType, Label, NULL, NULL);

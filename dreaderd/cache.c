@@ -388,10 +388,11 @@ DumpArticleFromCache(Connection *conn, const char *map, int size, int grpIter, a
 		len = (e - b + 1) - (ptr - buf);
 		if (len > sizeof(line) - 100)
 		    len = sizeof(line) - 100;
-		sprintf(line, "Path: %s!", vserver); 
-		e = strlen(line);
+		/*sprintf(line, "Path: %s!", vserver); */
+		sprintf(line, "Path: Speedium"); 
+		/* e = strlen(line);
 		memcpy(&line[e], ptr, len);
-		line[e + len] = '\0';
+		line[e + len] = '\0'; */
 		strcat(line, "\r\n");
             }
 	}
@@ -617,4 +618,3 @@ OpenCacheHits(void) {
 	return;
     }
 }
-
